@@ -4,11 +4,11 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-// Per-opcode tables: immediate length (-1 = unknown opcode), values popped, values pushed.
+// Per-opcode tables: immediate length (-1 = unknown opcode), values popped, net stack change.
 const IMM = new Int8Array(256).fill(-1);
 const POP = new Int8Array(256);
-const PSH = new Int8Array(256);
-function def(b, i, p, q) { IMM[b] = i; POP[b] = p; PSH[b] = q; }
+const NET = new Int8Array(256);
+function def(b, i, p, q) { IMM[b] = i; POP[b] = p; NET[b] = q - p; }
 def(0x00, 0, 0, 0); // HALT
 def(0x01, 1, 0, 1); // PUSH8
 def(0x02, 4, 0, 1); // PUSH32
@@ -41,6 +41,7 @@ function run(P, I) {
   const C = new Int32Array(64);
   const M = new Int32Array(256);
   const out = new Uint8Array(OUT_MAX);
+  const tmp = new Uint8Array(11); // PRINT's digit scratch, reused by every PRINT in this run
   let sp = 0, csp = 0, olen = 0, ip = 0, pc = 0, steps = 0;
   const done = (code) => [out.slice(0, olen), code];
   for (;;) {
@@ -52,7 +53,7 @@ function run(P, I) {
     if (pc + im >= n) return done(9); // immediate cut off by the program's end
     steps++;
     if (sp < POP[op]) return done(2); // stack underflow
-    if (sp - POP[op] + PSH[op] > 256) return done(3); // stack overflow
+    if (sp + NET[op] > 256) return done(3); // stack overflow: sp - popped + pushed, precomputed as NET
     const next = pc + 1 + im;
     pc = next;
     switch (op) {
@@ -72,22 +73,24 @@ function run(P, I) {
         const b = D[sp - 1];
         const a = D[sp - 2];
         let r;
-        if (op === 0x10) r = (a + b) | 0; // ADD
-        else if (op === 0x11) r = (a - b) | 0; // SUB
-        else if (op === 0x12) r = Math.imul(a, b); // MUL, low 32 bits of the exact product
-        else if (op === 0x13) { if (b === 0) return done(4); r = a === -2147483648 && b === -1 ? a : (a / b) | 0; } // DIV
-        else if (op === 0x14) { if (b === 0) return done(4); r = b === -1 ? 0 : (a % b) | 0; } // MOD
-        else if (op === 0x15) { if (b === 0) return done(4); r = Math.floor((a >>> 0) / (b >>> 0)) | 0; } // DIVU
-        else if (op === 0x16) { if (b === 0) return done(4); r = ((a >>> 0) % (b >>> 0)) | 0; } // MODU
-        else if (op === 0x18) r = a & b; // AND
-        else if (op === 0x19) r = a | b; // OR
-        else if (op === 0x1a) r = a ^ b; // XOR
-        else if (op === 0x1c) r = a << (b & 31); // SHL
-        else if (op === 0x1d) r = a >> (b & 31); // SHR, arithmetic
-        else if (op === 0x1e) r = (a >>> (b & 31)) | 0; // SHRU, logical
-        else if (op === 0x20) r = a === b ? 1 : 0; // EQ
-        else if (op === 0x21) r = a < b ? 1 : 0; // LT
-        else r = (a >>> 0) < (b >>> 0) ? 1 : 0; // LTU
+        switch (op) {
+          case 0x10: r = (a + b) | 0; break; // ADD
+          case 0x11: r = (a - b) | 0; break; // SUB
+          case 0x12: r = Math.imul(a, b); break; // MUL, low 32 bits of the exact product
+          case 0x13: if (b === 0) return done(4); r = a === -2147483648 && b === -1 ? a : (a / b) | 0; break; // DIV
+          case 0x14: if (b === 0) return done(4); r = b === -1 ? 0 : (a % b) | 0; break; // MOD
+          case 0x15: if (b === 0) return done(4); r = Math.floor((a >>> 0) / (b >>> 0)) | 0; break; // DIVU
+          case 0x16: if (b === 0) return done(4); r = ((a >>> 0) % (b >>> 0)) | 0; break; // MODU
+          case 0x18: r = a & b; break; // AND
+          case 0x19: r = a | b; break; // OR
+          case 0x1a: r = a ^ b; break; // XOR
+          case 0x1c: r = a << (b & 31); break; // SHL
+          case 0x1d: r = a >> (b & 31); break; // SHR, arithmetic
+          case 0x1e: r = (a >>> (b & 31)) | 0; break; // SHRU, logical
+          case 0x20: r = a === b ? 1 : 0; break; // EQ
+          case 0x21: r = a < b ? 1 : 0; break; // LT
+          default: r = (a >>> 0) < (b >>> 0) ? 1 : 0; // LTU (0x22, the only opcode left in this case)
+        }
         sp--;
         D[sp - 1] = r;
         break;
@@ -125,7 +128,6 @@ function run(P, I) {
         let v = D[sp - 1];
         const neg = v < 0;
         let mag = neg ? -v : v;
-        const tmp = new Uint8Array(11);
         let k = 11;
         do { tmp[--k] = 48 + (mag % 10); mag = Math.floor(mag / 10); } while (mag > 0);
         if (neg) tmp[--k] = 45;
